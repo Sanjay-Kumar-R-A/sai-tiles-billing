@@ -1139,6 +1139,67 @@ export class BillingRepository {
     return this.getInvoice(invoice.id);
   }
 
+  deleteInvoice(invoiceId) {
+    const invoice = this.getInvoice(Number(invoiceId));
+    const wasActive = invoice.status === 'active';
+
+    withTransaction(this.db, () => {
+      const now = nowIso();
+
+      if (wasActive) {
+        const updateStock = this.db.prepare(
+          'UPDATE products SET stock_boxes = ?, updated_at = ? WHERE id = ?'
+        );
+        const insertMovement = this.db.prepare(`
+          INSERT INTO stock_movements (
+            product_id, movement_date, type, qty_boxes, unit_cost, reference, notes, invoice_id, created_at
+          ) VALUES (?, ?, 'delete', ?, ?, ?, 'Bill deleted', NULL, ?)
+        `);
+
+        for (const item of invoice.items) {
+          if (!item.productId || item.stockBoxes <= 0) continue;
+          const product = this.db
+            .prepare('SELECT stock_boxes, cost_per_box FROM products WHERE id = ?')
+            .get(item.productId);
+          if (!product) continue;
+          updateStock.run(round3(Number(product.stock_boxes) + item.stockBoxes), now, item.productId);
+          insertMovement.run(
+            item.productId,
+            todayISO(),
+            Math.abs(item.stockBoxes),
+            product.cost_per_box,
+            invoice.invoiceNo,
+            now
+          );
+        }
+      }
+
+      this.db
+        .prepare('UPDATE stock_movements SET invoice_id = NULL WHERE invoice_id = ?')
+        .run(invoice.id);
+      this.db.prepare('DELETE FROM payments WHERE invoice_id = ?').run(invoice.id);
+      this.db.prepare('DELETE FROM invoice_items WHERE invoice_id = ?').run(invoice.id);
+      this.db.prepare('DELETE FROM invoices WHERE id = ?').run(invoice.id);
+
+      const suffix = Number(invoice.invoiceNo.match(/(\d+)$/)?.[1] ?? 0);
+      if (suffix > 0) {
+        const sequence = this.db
+          .prepare("SELECT next_value FROM sequences WHERE name = 'invoice'")
+          .get();
+        const next = Math.max(Number(sequence?.next_value ?? 1), suffix + 1);
+        if (sequence) {
+          this.db.prepare("UPDATE sequences SET next_value = ? WHERE name = 'invoice'").run(next);
+        } else {
+          this.db
+            .prepare("INSERT INTO sequences (name, next_value) VALUES ('invoice', ?)")
+            .run(next);
+        }
+      }
+    });
+
+    return { id: invoice.id, invoiceNo: invoice.invoiceNo, stockRestored: wasActive };
+  }
+
   listStockMovements({ productId = null, search = '', limit = 100 } = {}) {
     const where = [];
     const params = [];

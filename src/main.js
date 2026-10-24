@@ -234,6 +234,7 @@ function registerIpcHandlers() {
   handle('invoices:get', (id) => repository.getInvoice(id));
   handle('invoices:create', (input) => repository.createInvoice(input));
   handle('invoices:void', (id, reason) => repository.voidInvoice(id, reason));
+  handle('invoices:delete', (id) => repository.deleteInvoice(id));
   handle('invoices:addPayment', (id, payment) => repository.addPayment(id, payment));
   handle('invoices:deletePayment', (paymentId) => repository.deletePayment(paymentId));
 

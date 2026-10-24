@@ -3023,7 +3023,8 @@ svg {
   color: var(--accent-dark);
 }
 
-.movement-type.void {
+.movement-type.void,
+.movement-type.delete {
   background: var(--red-soft);
   color: var(--red);
 }

@@ -42,6 +42,7 @@ contextBridge.exposeInMainWorld('tiledesk', {
     get: invoke('invoices:get'),
     create: invoke('invoices:create'),
     void: invoke('invoices:void'),
+    deleteInvoice: invoke('invoices:delete'),
     addPayment: invoke('invoices:addPayment'),
     deletePayment: invoke('invoices:deletePayment')
   },

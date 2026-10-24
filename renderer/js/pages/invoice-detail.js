@@ -166,9 +166,12 @@ function invoiceBody(invoice, settings) {
               </div>
             </div>
             <dl class="meta-card">${metaRows(invoice)}</dl>
-            ${invoice.status === 'active'
-              ? `<div style="padding:2px 19px 16px;"><button type="button" class="btn btn-sm btn-danger-soft" data-action="void-invoice">${icon('xCircle')} Cancel this invoice</button></div>`
-              : ''}
+            <div class="row wrap" style="padding:2px 19px 16px;gap:8px;">
+              ${invoice.status === 'active'
+                ? `<button type="button" class="btn btn-sm btn-danger-soft" data-action="void-invoice">${icon('xCircle')} Cancel this invoice</button>`
+                : ''}
+              <button type="button" class="btn btn-sm btn-danger-soft" data-action="delete-invoice">${icon('trash')} Delete bill</button>
+            </div>
           </section>
         </aside>
       </div>
@@ -304,6 +307,65 @@ function openVoidModal(invoice, ctx) {
   });
 }
 
+function openDeleteModal(invoice) {
+  const formId = `delete-form-${Date.now()}`;
+  const paymentNote =
+    invoice.payments.length === 0
+      ? 'No payment entries are attached to it.'
+      : invoice.payments.length === 1
+        ? 'Its one payment entry will be erased too.'
+        : `Its ${invoice.payments.length} payment entries will be erased too.`;
+  openModal({
+    eyebrow: 'Permanent deletion',
+    title: `Delete ${invoice.invoiceNo}?`,
+    subtitle: 'This removes the bill from your records for good.',
+    body: `
+      <div class="modal-icon danger">${icon('alert')}</div>
+      <p class="muted" style="margin:0 0 14px;font-size:12px;line-height:1.6;">
+        The bill and its line items will be erased. ${paymentNote}
+        ${invoice.status === 'active' ? 'Stock for every tracked item on this bill is returned to the catalogue.' : 'Stock was already returned when this bill was cancelled.'}
+        The invoice number <strong>${escapeHtml(invoice.invoiceNo)}</strong> is kept reserved and will never be reused.
+      </p>
+      <form id="${formId}" novalidate>
+        <div class="form-error hidden" data-form-error></div>
+        <div class="field">
+          <label for="del-confirm">Type <span class="mono">${escapeHtml(invoice.invoiceNo)}</span> to confirm</label>
+          <input class="input" id="del-confirm" name="confirm" placeholder="${escapeHtml(invoice.invoiceNo)}" autocomplete="off" spellcheck="false" data-autofocus />
+        </div>
+      </form>
+    `,
+    footer: `
+      <button type="button" class="btn" data-cancel>Keep invoice</button>
+      <button type="submit" class="btn btn-danger" form="${formId}" data-save>Delete permanently</button>
+    `,
+    onMount(modal, close) {
+      const form = modal.querySelector(`#${formId}`);
+      const saveButton = modal.querySelector('[data-save]');
+      modal.querySelector('[data-cancel]').addEventListener('click', close);
+      form.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        clearFormError(form);
+        const typed = formDataObject(form).confirm.trim();
+        if (typed.toUpperCase() !== invoice.invoiceNo.toUpperCase()) {
+          showFormError(form, `Type ${invoice.invoiceNo} exactly to confirm.`);
+          form.querySelector('[name="confirm"]').focus();
+          return;
+        }
+        setButtonLoading(saveButton, true, 'Deleting…');
+        try {
+          await window.tiledesk.invoices.deleteInvoice(invoice.id);
+          close();
+          toast(`${invoice.invoiceNo} deleted. The invoice number will not be reused.`, 'success');
+          navigate('/invoices');
+        } catch (error) {
+          setButtonLoading(saveButton, false);
+          showFormError(form, error.message);
+        }
+      });
+    }
+  });
+}
+
 async function deletePayment(invoice, paymentId, ctx) {
   const payment = invoice.payments.find((entry) => entry.id === Number(paymentId));
   if (!payment) return;
@@ -371,6 +433,10 @@ export async function render(root, ctx) {
       }
       if (event.target.closest('[data-action="void-invoice"]')) {
         openVoidModal(invoice, ctx);
+        return;
+      }
+      if (event.target.closest('[data-action="delete-invoice"]')) {
+        openDeleteModal(invoice);
         return;
       }
       const deleteButton = event.target.closest('[data-delete-payment]');

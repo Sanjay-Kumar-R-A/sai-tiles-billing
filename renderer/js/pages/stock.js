@@ -23,6 +23,7 @@ const MOVEMENT_TYPES = [
   { value: 'sale', label: 'Sales' },
   { value: 'adjustment', label: 'Adjustments' },
   { value: 'void', label: 'Invoice voids' },
+  { value: 'delete', label: 'Bill deletions' },
   { value: 'opening', label: 'Opening stock' }
 ];
 
@@ -31,6 +32,7 @@ const TYPE_LABELS = {
   sale: 'Sale',
   adjustment: 'Adjustment',
   void: 'Invoice void',
+  delete: 'Bill deletion',
   opening: 'Opening stock'
 };
 
