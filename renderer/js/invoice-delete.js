@@ -27,7 +27,7 @@ export function openInvoiceDeleteModal(invoice, { onDeleted } = {}) {
       <p class="muted" style="margin:0 0 14px;font-size:12px;line-height:1.6;">
         The bill and its line items will be erased. ${paymentNote}
         ${invoice.status === 'active' ? 'Stock for every tracked item on this bill is returned to the catalogue.' : 'Stock was already returned when this bill was cancelled.'}
-        The invoice number <strong>${escapeHtml(invoice.invoiceNo)}</strong> is kept reserved and will never be reused.
+        The invoice number <strong>${escapeHtml(invoice.invoiceNo)}</strong> is released after deletion, so it can be used again.
       </p>
       <form id="${formId}" novalidate>
         <div class="form-error hidden" data-form-error></div>
@@ -58,7 +58,7 @@ export function openInvoiceDeleteModal(invoice, { onDeleted } = {}) {
         try {
           await window.tiledesk.invoices.deleteInvoice(invoice.id);
           close();
-          toast(`${invoice.invoiceNo} deleted. The invoice number will not be reused.`, 'success');
+          toast(`${invoice.invoiceNo} deleted. Its number is available for reuse.`, 'success');
           onDeleted?.();
         } catch (error) {
           setButtonLoading(saveButton, false);

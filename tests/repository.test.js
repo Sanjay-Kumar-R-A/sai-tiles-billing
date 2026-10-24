@@ -148,7 +148,7 @@ test('inter-state invoice uses IGST, supports part-payment, and void restores st
   assert.equal(movements[0].qtyBoxes, 2);
 });
 
-test('deleting an active invoice restores stock, keeps the ledger, and never reuses its number', (t) => {
+test('deleting an active invoice restores stock, keeps the ledger, and releases its number', (t) => {
   const { db, repo, product, customer } = fixture(t);
   const invoice = createStandardInvoice(repo, customer, product);
   assert.equal(invoice.invoiceNo, 'INV-0001');
@@ -162,6 +162,7 @@ test('deleting an active invoice restores stock, keeps the ledger, and never reu
   assert.throws(() => repo.getInvoice(invoice.id), /not found/i);
   assert.equal(db.prepare('SELECT COUNT(*) AS count FROM payments').get().count, 0);
   assert.equal(db.prepare('SELECT COUNT(*) AS count FROM invoice_items').get().count, 0);
+  assert.equal(repo.getNextInvoicePreview(), 'INV-0001');
 
   const movements = repo.listStockMovements({ productId: product.id });
   const deleted = movements.find((movement) => movement.type === 'delete');
@@ -173,10 +174,10 @@ test('deleting an active invoice restores stock, keeps the ledger, and never reu
   assert.equal(sale.invoiceId, null);
 
   const next = createStandardInvoice(repo, customer, product);
-  assert.equal(next.invoiceNo, 'INV-0002');
+  assert.equal(next.invoiceNo, 'INV-0001');
 });
 
-test('deleting a cancelled invoice never restores stock twice and keeps its number', (t) => {
+test('deleting a cancelled invoice never restores stock twice and releases its number', (t) => {
   const { repo, product, customer } = fixture(t);
   const invoice = createStandardInvoice(repo, customer, product);
   repo.voidInvoice(invoice.id, 'Goods returned');
@@ -196,19 +197,49 @@ test('deleting a cancelled invoice never restores stock twice and keeps its numb
   assert.equal(movements[1].invoiceId, null);
 
   const next = createStandardInvoice(repo, customer, product);
-  assert.equal(next.invoiceNo, 'INV-0002');
+  assert.equal(next.invoiceNo, 'INV-0001');
 });
 
-test('deleting an earlier bill does not roll back the invoice number sequence', (t) => {
+test('deleting an earlier bill does not renumber later bills', (t) => {
   const { repo, product, customer } = fixture(t);
   const first = createStandardInvoice(repo, customer, product);
   const second = createStandardInvoice(repo, customer, product);
   assert.equal(second.invoiceNo, 'INV-0002');
 
   repo.deleteInvoice(first.id);
+  assert.equal(repo.getNextInvoicePreview(), 'INV-0003');
 
   const third = createStandardInvoice(repo, customer, product);
   assert.equal(third.invoiceNo, 'INV-0003');
+});
+
+test('deleting the latest bill makes its number available again', (t) => {
+  const { repo, product, customer } = fixture(t);
+  createStandardInvoice(repo, customer, product);
+  const latest = createStandardInvoice(repo, customer, product);
+  assert.equal(latest.invoiceNo, 'INV-0002');
+
+  repo.deleteInvoice(latest.id);
+  assert.equal(repo.getNextInvoicePreview(), 'INV-0002');
+
+  const reused = createStandardInvoice(repo, customer, product);
+  assert.equal(reused.invoiceNo, 'INV-0002');
+
+  const next = createStandardInvoice(repo, customer, product);
+  assert.equal(next.invoiceNo, 'INV-0003');
+});
+
+test('restarting reconciles invoice numbers skipped by an earlier deletion', (t) => {
+  const { db, repo, product, customer } = fixture(t);
+  const invoice = createStandardInvoice(repo, customer, product);
+  repo.deleteInvoice(invoice.id);
+  db.prepare("UPDATE sequences SET next_value = 8 WHERE name = 'invoice'").run();
+
+  const restarted = new BillingRepository(db);
+  assert.equal(restarted.getNextInvoicePreview(), 'INV-0001');
+
+  const next = createStandardInvoice(restarted, customer, product);
+  assert.equal(next.invoiceNo, 'INV-0001');
 });
 
 test('stock-in adds stock and maintains a weighted average cost', (t) => {

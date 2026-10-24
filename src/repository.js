@@ -294,6 +294,7 @@ const CUSTOMER_SELECT = `
 export class BillingRepository {
   constructor(db) {
     this.db = db;
+    this.syncInvoiceSequence();
   }
 
   getSettings() {
@@ -683,6 +684,24 @@ export class BillingRepository {
       .prepare('UPDATE customers SET active = ?, updated_at = ? WHERE id = ?')
       .run(active ? 1 : 0, nowIso(), customer.id);
     return this.getCustomerSummary(customer.id);
+  }
+
+  syncInvoiceSequence() {
+    const remaining = this.db.prepare('SELECT invoice_no FROM invoices').all();
+    const highest = remaining.reduce((max, row) => {
+      const match = row.invoice_no.match(/(\d+)$/);
+      return match ? Math.max(max, Number(match[1])) : max;
+    }, 0);
+    const next = highest + 1;
+    const sequence = this.db
+      .prepare("SELECT next_value FROM sequences WHERE name = 'invoice'")
+      .get();
+    if (sequence) {
+      this.db.prepare("UPDATE sequences SET next_value = ? WHERE name = 'invoice'").run(next);
+    } else {
+      this.db.prepare("INSERT INTO sequences (name, next_value) VALUES ('invoice', ?)").run(next);
+    }
+    return next;
   }
 
   nextInvoiceNumber() {
@@ -1181,20 +1200,7 @@ export class BillingRepository {
       this.db.prepare('DELETE FROM invoice_items WHERE invoice_id = ?').run(invoice.id);
       this.db.prepare('DELETE FROM invoices WHERE id = ?').run(invoice.id);
 
-      const suffix = Number(invoice.invoiceNo.match(/(\d+)$/)?.[1] ?? 0);
-      if (suffix > 0) {
-        const sequence = this.db
-          .prepare("SELECT next_value FROM sequences WHERE name = 'invoice'")
-          .get();
-        const next = Math.max(Number(sequence?.next_value ?? 1), suffix + 1);
-        if (sequence) {
-          this.db.prepare("UPDATE sequences SET next_value = ? WHERE name = 'invoice'").run(next);
-        } else {
-          this.db
-            .prepare("INSERT INTO sequences (name, next_value) VALUES ('invoice', ?)")
-            .run(next);
-        }
-      }
+      this.syncInvoiceSequence();
     });
 
     return { id: invoice.id, invoiceNo: invoice.invoiceNo, stockRestored: wasActive };
