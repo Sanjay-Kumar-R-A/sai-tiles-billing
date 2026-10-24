@@ -5,7 +5,8 @@ import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { openDatabase } from './db.js';
 import { BillingRepository } from './repository.js';
-import { MAX_PDF_BYTES, extractCatalogueFromPdf } from './ai-catalogue.js';
+import { extractCatalogueFromPdf } from './ai-catalogue.js';
+import { MAX_PDF_BYTES } from '../shared/constants.js';
 import { todayISO } from '../shared/format.js';
 
 const APP_NAME = 'SAI TILES';
@@ -217,6 +218,17 @@ function handle(channel, callback) {
   });
 }
 
+function handleWithEvent(channel, callback) {
+  ipcMain.handle(channel, async (event, ...args) => {
+    try {
+      return success(await callback(event, ...args));
+    } catch (error) {
+      console.error(`[${channel}]`, error);
+      return failure(error);
+    }
+  });
+}
+
 function readAiKey() {
   if (sessionAiKey) return sessionAiKey;
   if (!database || !safeStorage.isEncryptionAvailable()) return '';
@@ -262,12 +274,44 @@ function withAiStatus(settings) {
   };
 }
 
-function pdfBufferFrom(data) {
-  if (Buffer.isBuffer(data)) return data;
-  if (data instanceof ArrayBuffer) return Buffer.from(data);
-  if (ArrayBuffer.isView(data)) return Buffer.from(data.buffer, data.byteOffset, data.byteLength);
-  if (Array.isArray(data?.data)) return Buffer.from(data.data);
-  return null;
+function catalogueFileFrom(sourcePath, fileName) {
+  const raw = String(sourcePath ?? '').trim();
+  if (!raw) throw new Error('Choose a PDF catalogue first.');
+  const resolved = path.resolve(raw);
+  let stat;
+  try {
+    stat = fs.statSync(resolved);
+  } catch {
+    throw new Error('The PDF could not be found. Choose it again.');
+  }
+  if (!stat.isFile()) throw new Error('That is not a PDF file. Choose a catalogue or price list.');
+  if (!stat.size) throw new Error('That PDF is empty.');
+  if (stat.size > MAX_PDF_BYTES) {
+    throw new Error('This PDF is larger than 1 GB. Split the catalogue into smaller files.');
+  }
+
+  let header;
+  try {
+    const handle = fs.openSync(resolved, 'r');
+    try {
+      const buffer = Buffer.alloc(1024);
+      const bytes = fs.readSync(handle, buffer, 0, buffer.length, 0);
+      header = buffer.subarray(0, bytes);
+    } finally {
+      fs.closeSync(handle);
+    }
+  } catch {
+    throw new Error('The PDF could not be opened. Choose it again.');
+  }
+  if (!header.includes(Buffer.from('%PDF-'))) {
+    throw new Error('That file is not a PDF. Choose a PDF catalogue or price list.');
+  }
+
+  return {
+    path: resolved,
+    size: stat.size,
+    name: safePdfFileName(fileName || path.basename(resolved))
+  };
 }
 
 function safePdfFileName(value) {
@@ -291,33 +335,32 @@ function registerIpcHandlers() {
   });
   handle('categories:list', () => repository.getCategories());
 
-  handle('catalogue:extract', async ({ data, fileName } = {}) => {
-    const pdfBuffer = pdfBufferFrom(data);
-    if (!pdfBuffer?.length) throw new Error('Choose a PDF catalogue first.');
-    if (pdfBuffer.length > MAX_PDF_BYTES) {
-      throw new Error('This PDF is larger than 25 MB. Try a smaller catalogue.');
-    }
-    if (!pdfBuffer.subarray(0, 1024).includes(Buffer.from('%PDF-'))) {
-      throw new Error('That file is not a PDF. Choose a PDF catalogue or price list.');
-    }
+  handleWithEvent('catalogue:extract', async (event, { path: sourcePath, fileName, requestId } = {}) => {
+    const file = catalogueFileFrom(sourcePath, fileName);
 
     const settings = repository.getSettings();
     const apiKey = readAiKey();
     if (!apiKey) throw new Error('Add the AI API key in Settings → AI catalogue first.');
 
-    const safeName = safePdfFileName(fileName);
+    const progressId = String(requestId ?? '');
+    const onProgress = (progress) => {
+      if (event.sender.isDestroyed()) return;
+      event.sender.send('catalogue:progress', { requestId: progressId, ...progress });
+    };
+
     const extraction = await extractCatalogueFromPdf({
-      pdfBuffer,
-      fileName: safeName,
+      pdfPath: file.path,
+      fileName: file.name,
       apiKey,
       provider: settings.aiProvider,
       model: settings.aiModel,
-      baseUrl: settings.aiBaseUrl
+      baseUrl: settings.aiBaseUrl,
+      onProgress
     });
     const items = repository.previewCatalogue(extraction.products);
 
     return {
-      fileName: safeName,
+      fileName: file.name,
       supplier: extraction.supplier,
       provider: extraction.provider,
       model: extraction.model,

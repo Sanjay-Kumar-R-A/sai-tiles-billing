@@ -8,20 +8,22 @@ import {
   setButtonLoading,
   toast
 } from '../ui.js';
+import { MAX_PDF_BYTES, OPENAI_MAX_PDF_BYTES } from '../../../shared/constants.js';
 
-const MAX_PDF_BYTES = 25 * 1024 * 1024;
 const PROVIDER_LABELS = {
   gemini: 'Google Gemini',
   openai: 'OpenAI'
 };
 
 const state = {
-  file: null,
+  filePath: '',
   fileName: '',
   fileSize: 0,
   busy: false,
   importing: false,
   startedAt: 0,
+  requestId: '',
+  progress: null,
   error: '',
   keySet: false,
   provider: 'gemini',
@@ -38,6 +40,7 @@ const state = {
 let pageRoot = null;
 let pageAbort = null;
 let elapsedTimer = null;
+let progressUnsubscribe = null;
 let ctxRef = null;
 
 function providerLabel(provider = state.provider) {
@@ -47,7 +50,36 @@ function providerLabel(provider = state.provider) {
 function fileSizeText(bytes) {
   if (!bytes) return '';
   if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  const gigabytes = bytes / (1024 * 1024 * 1024);
+  return `${gigabytes.toFixed(gigabytes >= 10 ? 0 : 1)} GB`;
+}
+
+function pdfLimit() {
+  return state.provider === 'openai' ? OPENAI_MAX_PDF_BYTES : MAX_PDF_BYTES;
+}
+
+function limitText() {
+  const bytes = pdfLimit();
+  return bytes >= 1024 * 1024 * 1024 ? '1 GB' : `${Math.round(bytes / (1024 * 1024))} MB`;
+}
+
+function progressState() {
+  const progress = state.progress;
+  if (!progress) return { label: 'Opening the PDF…', width: null };
+  if (progress.stage === 'upload') {
+    const total = Number(progress.total) || 0;
+    const loaded = Math.min(Number(progress.loaded) || 0, total || Infinity);
+    const percent = total ? Math.max(0, Math.min(100, Math.round((loaded / total) * 100))) : 0;
+    return {
+      label: `Uploading ${fileSizeText(loaded)} of ${fileSizeText(total)} · ${percent}%`,
+      width: percent
+    };
+  }
+  if (progress.stage === 'processing') {
+    return { label: `${providerLabel()} is preparing the PDF…`, width: 100 };
+  }
+  return { label: `${providerLabel()} is reading the catalogue…`, width: 100 };
 }
 
 function importable(row) {
@@ -77,12 +109,14 @@ function counts() {
 }
 
 function startOver() {
-  state.file = null;
+  state.filePath = '';
   state.fileName = '';
   state.fileSize = 0;
   state.busy = false;
   state.importing = false;
   state.startedAt = 0;
+  state.requestId = '';
+  state.progress = null;
   state.error = '';
   state.supplier = '';
   state.items = [];
@@ -126,12 +160,20 @@ function fileMarkup() {
 }
 
 function busyMarkup() {
+  const progress = progressState();
+  const width = progress.width == null ? '' : ` style="width:${progress.width}%"`;
   return `
     <div class="import-busy">
       <span class="import-spinner" aria-hidden="true"></span>
       <div class="import-busy-copy">
         <div class="import-busy-title">Reading ${escapeHtml(state.fileName)} with ${escapeHtml(providerLabel())}…</div>
-        <div class="import-busy-text">Large catalogues can take up to a minute. Keep this window open. <span data-elapsed></span></div>
+        <div class="import-busy-text">Large catalogues can take several minutes. Keep this window open. <span data-elapsed></span></div>
+        <div class="import-progress">
+          <div class="import-progress-track">
+            <span class="import-progress-fill${progress.width == null ? ' is-indeterminate' : ''}" data-progress-bar${width}></span>
+          </div>
+          <span class="import-progress-label" data-progress-label>${escapeHtml(progress.label)}</span>
+        </div>
       </div>
     </div>
   `;
@@ -165,6 +207,9 @@ function errorNoticeMarkup() {
 }
 
 function uploadCardMarkup() {
+  const openAiHint = state.provider === 'openai'
+    ? `<p class="hint">OpenAI accepts catalogues up to 32 MB. Switch to Google Gemini for PDFs up to 1 GB.</p>`
+    : '';
   return `
     <section class="card import-card">
       <div class="setting-section-head">
@@ -172,13 +217,14 @@ function uploadCardMarkup() {
           <h2 class="setting-section-title">1 · Upload the catalogue</h2>
           <div class="setting-section-sub">Pick a PDF catalogue or price list. ${escapeHtml(providerLabel())} reads it and prepares the changes for you to review.</div>
         </div>
-        <span class="chip chip-neutral">PDF · up to 25 MB</span>
+        <span class="chip chip-neutral">PDF · up to ${limitText()}</span>
       </div>
       <div class="setting-section-body">
         ${setupNoticeMarkup()}
         ${errorNoticeMarkup()}
-        ${state.busy ? busyMarkup() : state.file ? fileMarkup() : dropzoneMarkup()}
-        <p class="import-privacy">${icon('shield')} The chosen PDF is sent to ${escapeHtml(providerLabel())} only when you extract. Bills, customers and your saved catalogue stay on this Mac.</p>
+        ${state.busy ? busyMarkup() : state.filePath ? fileMarkup() : dropzoneMarkup()}
+        ${openAiHint}
+        <p class="import-privacy">${icon('shield')} The chosen PDF is sent to ${escapeHtml(providerLabel())} only when you extract, and large uploads are deleted afterwards. Bills, customers and your saved catalogue stay on this Mac.</p>
       </div>
     </section>
   `;
@@ -461,6 +507,27 @@ function refreshElapsed() {
   target.textContent = seconds >= 3 ? `${seconds}s elapsed` : '';
 }
 
+function applyProgressUi() {
+  const label = pageRoot?.querySelector('[data-progress-label]');
+  const bar = pageRoot?.querySelector('[data-progress-bar]');
+  if (!label || !bar) return;
+  const progress = progressState();
+  label.textContent = progress.label;
+  if (progress.width == null) {
+    bar.classList.add('is-indeterminate');
+    bar.style.width = '';
+  } else {
+    bar.classList.remove('is-indeterminate');
+    bar.style.width = `${progress.width}%`;
+  }
+}
+
+function handleProgress(payload) {
+  if (!state.busy || !payload || payload.requestId !== state.requestId) return;
+  state.progress = payload;
+  applyProgressUi();
+}
+
 function syncSelectionUi() {
   if (!pageRoot) return;
   let selectable = 0;
@@ -515,13 +582,25 @@ function acceptFile(file) {
     toast('That PDF is empty.', 'error');
     return;
   }
-  if (file.size > MAX_PDF_BYTES) {
-    toast('That PDF is larger than 25 MB. Try a smaller catalogue.', 'error');
+  const filePath = window.tiledesk.catalogue.pathForFile?.(file) || '';
+  if (!filePath) {
+    toast('Drag the PDF in from Finder so the app can read it.', 'error');
     return;
   }
-  state.file = file;
+  if (file.size > pdfLimit()) {
+    toast(
+      state.provider === 'openai'
+        ? 'OpenAI accepts PDFs up to 32 MB. Switch to Google Gemini for catalogues up to 1 GB.'
+        : 'That PDF is larger than 1 GB. Split the catalogue into smaller files.',
+      'error'
+    );
+    return;
+  }
+  state.filePath = filePath;
   state.fileName = file.name;
   state.fileSize = file.size;
+  state.requestId = '';
+  state.progress = null;
   state.error = '';
   state.items = [];
   state.warnings = [];
@@ -535,7 +614,7 @@ function chooseFile() {
 }
 
 async function extractCatalogue() {
-  if (!state.file || state.busy) return;
+  if (!state.filePath || state.busy) return;
   if (!state.keySet) {
     toast('Add an AI API key in Settings → AI catalogue first.', 'info');
     return;
@@ -543,10 +622,15 @@ async function extractCatalogue() {
   state.busy = true;
   state.error = '';
   state.startedAt = Date.now();
+  state.requestId = window.crypto.randomUUID();
+  state.progress = null;
   paint();
   try {
-    const data = await state.file.arrayBuffer();
-    const result = await window.tiledesk.catalogue.extract({ data, fileName: state.fileName });
+    const result = await window.tiledesk.catalogue.extract({
+      path: state.filePath,
+      fileName: state.fileName,
+      requestId: state.requestId
+    });
     const items = Array.isArray(result?.items) ? result.items : [];
     state.items = items;
     state.warnings = Array.isArray(result?.warnings) ? result.warnings : [];
@@ -561,6 +645,8 @@ async function extractCatalogue() {
   } finally {
     state.busy = false;
     state.startedAt = 0;
+    state.requestId = '';
+    state.progress = null;
     stopElapsed();
     paint();
   }
@@ -791,13 +877,17 @@ export async function render(root, ctx) {
   pageRoot = root;
   ctxRef = ctx;
   stopElapsed();
+  progressUnsubscribe?.();
+  progressUnsubscribe = window.tiledesk.catalogue.onProgress?.(handleProgress) ?? null;
 
-  state.file = null;
+  state.filePath = '';
   state.fileName = '';
   state.fileSize = 0;
   state.busy = false;
   state.importing = false;
   state.startedAt = 0;
+  state.requestId = '';
+  state.progress = null;
   state.error = '';
   state.supplier = '';
   state.items = [];
@@ -837,6 +927,8 @@ export function cleanup() {
     pageAbort.abort();
     pageAbort = null;
   }
+  progressUnsubscribe?.();
+  progressUnsubscribe = null;
   stopElapsed();
   pageRoot = null;
   ctxRef = null;

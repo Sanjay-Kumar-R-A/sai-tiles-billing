@@ -4153,6 +4153,11 @@ body.modal-open {
   flex-shrink: 0;
 }
 
+.import-busy-copy {
+  flex: 1;
+  min-width: 0;
+}
+
 .import-busy-title {
   font-size: 12px;
   font-weight: 650;
@@ -4166,6 +4171,48 @@ body.modal-open {
 
 .import-busy-text span {
   font-variant-numeric: tabular-nums;
+}
+
+.import-progress {
+  display: grid;
+  gap: 5px;
+  max-width: 560px;
+  margin-top: 10px;
+}
+
+.import-progress-track {
+  height: 5px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #e9dfcf;
+}
+
+.import-progress-fill {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width 0.25s ease;
+}
+
+.import-progress-fill.is-indeterminate {
+  width: 35%;
+  animation: importSweep 1.3s ease-in-out infinite;
+}
+
+.import-progress-label {
+  color: var(--muted);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+@keyframes importSweep {
+  0% {
+    transform: translateX(-110%);
+  }
+  100% {
+    transform: translateX(300%);
+  }
 }
 
 .import-privacy {

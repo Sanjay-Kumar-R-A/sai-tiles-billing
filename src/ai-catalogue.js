@@ -1,8 +1,20 @@
+import fs from 'node:fs/promises';
 import { GST_RATES } from '../shared/calc.js';
-import { PRODUCT_CATEGORIES } from '../shared/constants.js';
+import {
+  GEMINI_INLINE_MAX_BYTES,
+  GEMINI_UPLOAD_CHUNK_BYTES,
+  MAX_PDF_BYTES,
+  OPENAI_MAX_PDF_BYTES,
+  PRODUCT_CATEGORIES
+} from '../shared/constants.js';
 
 export const MAX_CATALOGUE_ITEMS = 300;
-export const MAX_PDF_BYTES = 25 * 1024 * 1024;
+
+const GENERATE_TIMEOUT_MS = 30 * 60 * 1000;
+const UPLOAD_START_TIMEOUT_MS = 2 * 60 * 1000;
+const UPLOAD_CHUNK_TIMEOUT_MS = 10 * 60 * 1000;
+const FILE_POLL_TIMEOUT_MS = 20 * 60 * 1000;
+const FILE_POLL_INTERVAL_MS = 2000;
 
 export const PROVIDER_DEFAULTS = {
   gemini: {
@@ -330,16 +342,19 @@ function providerErrorMessage(status, data) {
     return 'The AI provider is busy or the quota is exhausted. Wait a minute and try again.';
   }
   const detail = cleanText(data?.error?.message, 220);
+  if (/maximum number of tokens|token count|too many tokens|too many pages|page limit/i.test(detail)) {
+    return 'This catalogue is too large for the AI model to read in one go. Split the PDF into smaller parts and import them one after another.';
+  }
   if (detail) return `The AI provider refused the request: ${detail}`;
   if (status >= 500) return 'The AI provider had a server problem. Try again in a few minutes.';
   return 'The AI provider could not process this PDF. Try again.';
 }
 
-async function postJson(fetchImpl, url, options) {
+async function postJson(fetchImpl, url, options, timeoutMs = 180000) {
   try {
     return await fetchImpl(url, {
       ...options,
-      signal: AbortSignal.timeout(180000)
+      signal: AbortSignal.timeout(timeoutMs)
     });
   } catch (error) {
     if (error?.name === 'TimeoutError' || error?.name === 'AbortError') {
@@ -349,8 +364,19 @@ async function postJson(fetchImpl, url, options) {
   }
 }
 
-async function callGemini({ apiKey, model, baseUrl, pdfBase64, fetchImpl }) {
+function parseJsonSafe(text) {
+  try {
+    return text ? JSON.parse(text) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function callGemini({ apiKey, model, baseUrl, pdfBase64, fileUri, fetchImpl }) {
   const base = (baseUrl || PROVIDER_DEFAULTS.gemini.baseUrl).replace(/\/+$/, '');
+  const pdfPart = fileUri
+    ? { file_data: { mime_type: 'application/pdf', file_uri: fileUri } }
+    : { inline_data: { mime_type: 'application/pdf', data: pdfBase64 } };
   const response = await postJson(
     fetchImpl,
     `${base}/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`,
@@ -361,10 +387,7 @@ async function callGemini({ apiKey, model, baseUrl, pdfBase64, fetchImpl }) {
         contents: [
           {
             role: 'user',
-            parts: [
-              { inline_data: { mime_type: 'application/pdf', data: pdfBase64 } },
-              { text: PROMPT }
-            ]
+            parts: [pdfPart, { text: PROMPT }]
           }
         ],
         generationConfig: {
@@ -373,7 +396,8 @@ async function callGemini({ apiKey, model, baseUrl, pdfBase64, fetchImpl }) {
           maxOutputTokens: 65536
         }
       })
-    }
+    },
+    GENERATE_TIMEOUT_MS
   );
 
   const body = await response.text();
@@ -405,6 +429,180 @@ async function callGemini({ apiKey, model, baseUrl, pdfBase64, fetchImpl }) {
   return text;
 }
 
+function geminiUploadBase(baseUrl) {
+  const base = (baseUrl || PROVIDER_DEFAULTS.gemini.baseUrl).replace(/\/+$/, '');
+  return /\/v1beta$/.test(base)
+    ? `${base.slice(0, -'/v1beta'.length)}/upload/v1beta`
+    : `${base}/upload/v1beta`;
+}
+
+function geminiFilePath(file) {
+  const name = cleanText(file?.name, 300);
+  if (!name) return '';
+  return name.startsWith('files/') ? name : `files/${name}`;
+}
+
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function uploadGeminiFile({ apiKey, baseUrl, fileName, pdfPath, pdfSize, fetchImpl, onProgress }) {
+  const key = encodeURIComponent(apiKey);
+  const uploadBase = geminiUploadBase(baseUrl);
+  const displayName = cleanText(fileName, 120) || 'catalogue.pdf';
+  const uploadName = displayName.replace(/[^\x20-\x7E]/g, '_');
+  const startResponse = await postJson(
+    fetchImpl,
+    `${uploadBase}/files?key=${key}`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Goog-Upload-Protocol': 'resumable',
+        'X-Goog-Upload-Command': 'start',
+        'X-Goog-Upload-Header-Content-Length': String(pdfSize),
+        'X-Goog-Upload-Header-Content-Type': 'application/pdf',
+        'X-Goog-Upload-File-Name': uploadName
+      },
+      body: JSON.stringify({
+        file: {
+          display_name: displayName,
+          mime_type: 'application/pdf',
+          size_bytes: String(pdfSize)
+        }
+      })
+    },
+    UPLOAD_START_TIMEOUT_MS
+  );
+  const startBody = await startResponse.text();
+  if (!startResponse.ok) {
+    throw new Error(providerErrorMessage(startResponse.status, parseJsonSafe(startBody)));
+  }
+  const startData = parseJsonSafe(startBody);
+  const uploadUrl = startResponse.headers?.get?.('x-goog-upload-url') || startData?.upload_url || '';
+  if (!uploadUrl) {
+    throw new Error('The AI provider did not start the upload. Try again.');
+  }
+
+  onProgress?.({ stage: 'upload', loaded: 0, total: pdfSize, provider: 'gemini' });
+
+  const handle = await fs.open(pdfPath, 'r');
+  let uploaded = null;
+  try {
+    for (let offset = 0; offset < pdfSize; offset += GEMINI_UPLOAD_CHUNK_BYTES) {
+      const length = Math.min(GEMINI_UPLOAD_CHUNK_BYTES, pdfSize - offset);
+      const buffer = Buffer.allocUnsafe(length);
+      const { bytesRead } = await handle.read(buffer, 0, length, offset);
+      if (bytesRead !== length) {
+        throw new Error('The PDF changed while it was being uploaded. Choose it again.');
+      }
+      const isLast = offset + bytesRead >= pdfSize;
+      const response = await postJson(
+        fetchImpl,
+        uploadUrl,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/pdf',
+            'X-Goog-Upload-Offset': String(offset),
+            'X-Goog-Upload-Command': isLast ? 'upload, finalize' : 'upload'
+          },
+          body: buffer
+        },
+        UPLOAD_CHUNK_TIMEOUT_MS
+      );
+      const body = await response.text();
+      const uploadStatus = response.headers?.get?.('x-goog-upload-status');
+      const chunkAccepted = response.ok || (!isLast && response.status === 308);
+      if (!chunkAccepted) {
+        throw new Error(providerErrorMessage(response.status, parseJsonSafe(body)));
+      }
+      if (isLast) {
+        const data = parseJsonSafe(body);
+        uploaded = data?.file ?? data ?? null;
+      } else if (uploadStatus === 'cancelled') {
+        throw new Error('The PDF upload was cancelled. Try again.');
+      }
+      onProgress?.({
+        stage: 'upload',
+        loaded: Math.min(offset + bytesRead, pdfSize),
+        total: pdfSize,
+        provider: 'gemini'
+      });
+    }
+  } finally {
+    await handle.close().catch(() => {});
+  }
+
+  if (!uploaded?.name) {
+    throw new Error('The AI provider did not finish the upload. Try again.');
+  }
+  return uploaded;
+}
+
+async function waitForGeminiFile({ apiKey, baseUrl, file, fetchImpl, onProgress }) {
+  const base = (baseUrl || PROVIDER_DEFAULTS.gemini.baseUrl).replace(/\/+$/, '');
+  const key = encodeURIComponent(apiKey);
+  const path = geminiFilePath(file);
+  let current = file;
+  if (!current.state || current.state === 'ACTIVE') return current;
+
+  onProgress?.({ stage: 'processing', provider: 'gemini' });
+  const startedAt = Date.now();
+  while (current.state !== 'ACTIVE') {
+    if (current.state === 'FAILED') {
+      throw new Error('The AI provider could not prepare this PDF. Try another file.');
+    }
+    if (Date.now() - startedAt > FILE_POLL_TIMEOUT_MS) {
+      throw new Error('The AI provider took too long to prepare this PDF. Try again.');
+    }
+    await wait(FILE_POLL_INTERVAL_MS);
+    const response = await postJson(
+      fetchImpl,
+      `${base}/${path}?key=${key}`,
+      { method: 'GET' },
+      UPLOAD_START_TIMEOUT_MS
+    );
+    const body = await response.text();
+    const data = parseJsonSafe(body);
+    if (!response.ok) throw new Error(providerErrorMessage(response.status, data));
+    current = data?.file ?? data ?? current;
+  }
+  return current;
+}
+
+async function deleteGeminiFile({ apiKey, baseUrl, file, fetchImpl }) {
+  const base = (baseUrl || PROVIDER_DEFAULTS.gemini.baseUrl).replace(/\/+$/, '');
+  const path = geminiFilePath(file);
+  if (!path) return;
+  await postJson(
+    fetchImpl,
+    `${base}/${path}?key=${encodeURIComponent(apiKey)}`,
+    { method: 'DELETE' },
+    30000
+  ).catch(() => {});
+}
+
+async function callGeminiFileApi({ apiKey, model, baseUrl, fileName, pdfPath, pdfSize, fetchImpl, onProgress }) {
+  const file = await uploadGeminiFile({
+    apiKey,
+    baseUrl,
+    fileName,
+    pdfPath,
+    pdfSize,
+    fetchImpl,
+    onProgress
+  });
+  try {
+    const ready = await waitForGeminiFile({ apiKey, baseUrl, file, fetchImpl, onProgress });
+    const fileUri = ready.uri || `${(baseUrl || PROVIDER_DEFAULTS.gemini.baseUrl).replace(/\/+$/, '')}/${geminiFilePath(ready)}`;
+    onProgress?.({ stage: 'reading', provider: 'gemini' });
+    return await callGemini({ apiKey, model, baseUrl, fileUri, fetchImpl });
+  } finally {
+    await deleteGeminiFile({ apiKey, baseUrl, file, fetchImpl });
+  }
+}
+
 async function callOpenAI({ apiKey, model, baseUrl, fileName, pdfBase64, fetchImpl }) {
   const base = (baseUrl || PROVIDER_DEFAULTS.openai.baseUrl).replace(/\/+$/, '');
   const response = await postJson(fetchImpl, `${base}/responses`, {
@@ -432,7 +630,7 @@ async function callOpenAI({ apiKey, model, baseUrl, fileName, pdfBase64, fetchIm
       text: { format: { type: 'json_object' } },
       max_output_tokens: 32000
     })
-  });
+  }, GENERATE_TIMEOUT_MS);
 
   const body = await response.text();
   let data = null;
@@ -464,19 +662,15 @@ async function callOpenAI({ apiKey, model, baseUrl, fileName, pdfBase64, fetchIm
 
 export async function extractCatalogueFromPdf({
   pdfBuffer,
+  pdfPath,
   fileName = 'catalogue.pdf',
   apiKey,
   provider = 'gemini',
   model,
   baseUrl = '',
-  fetchImpl = globalThis.fetch
+  fetchImpl = globalThis.fetch,
+  onProgress
 } = {}) {
-  if (!Buffer.isBuffer(pdfBuffer) || !pdfBuffer.length) {
-    throw new Error('Choose a PDF catalogue first.');
-  }
-  if (pdfBuffer.length > MAX_PDF_BYTES) {
-    throw new Error('This PDF is larger than 25 MB. Try a smaller catalogue.');
-  }
   const key = cleanText(apiKey, 400);
   if (!key) throw new Error('Add the AI API key in Settings → AI catalogue first.');
   const selectedProvider = provider === 'openai' ? 'openai' : provider === 'gemini' ? 'gemini' : null;
@@ -484,19 +678,66 @@ export async function extractCatalogueFromPdf({
   const selectedModel = cleanText(model, 80) || PROVIDER_DEFAULTS[selectedProvider].model;
   if (typeof fetchImpl !== 'function') throw new Error('This Mac cannot reach the AI provider.');
 
-  const pdfBase64 = pdfBuffer.toString('base64');
+  let size = 0;
+  if (Buffer.isBuffer(pdfBuffer) && pdfBuffer.length) {
+    size = pdfBuffer.length;
+  } else if (typeof pdfPath === 'string' && pdfPath) {
+    try {
+      const stat = await fs.stat(pdfPath);
+      if (!stat.isFile()) throw new Error('not a file');
+      size = stat.size;
+    } catch {
+      throw new Error('The PDF could not be opened. Choose it again.');
+    }
+  } else {
+    throw new Error('Choose a PDF catalogue first.');
+  }
+  if (!size) throw new Error('That PDF is empty.');
+  if (size > MAX_PDF_BYTES) {
+    throw new Error('This PDF is larger than 1 GB. Split the catalogue into smaller files.');
+  }
+  if (selectedProvider === 'openai' && size > OPENAI_MAX_PDF_BYTES) {
+    throw new Error(
+      'OpenAI accepts PDFs up to 32 MB in this app. Switch to Google Gemini in Settings → AI catalogue to import larger catalogues.'
+    );
+  }
+
+  const progress = typeof onProgress === 'function' ? onProgress : null;
   const common = {
     apiKey: key,
     model: selectedModel,
     baseUrl: cleanText(baseUrl, 300),
     fileName: cleanText(fileName, 160),
-    pdfBase64,
     fetchImpl
   };
-  const text =
-    selectedProvider === 'gemini'
-      ? await callGemini(common)
-      : await callOpenAI(common);
+
+  let text;
+  if (selectedProvider === 'gemini' && size > GEMINI_INLINE_MAX_BYTES) {
+    if (!pdfPath) {
+      throw new Error('Large PDFs must be chosen from this Mac.');
+    }
+    text = await callGeminiFileApi({
+      ...common,
+      pdfPath,
+      pdfSize: size,
+      onProgress: progress
+    });
+  } else {
+    let buffer = pdfBuffer;
+    if (!buffer?.length) {
+      try {
+        buffer = await fs.readFile(pdfPath);
+      } catch {
+        throw new Error('The PDF could not be opened. Choose it again.');
+      }
+    }
+    progress?.({ stage: 'reading', provider: selectedProvider });
+    const call = {
+      ...common,
+      pdfBase64: buffer.toString('base64')
+    };
+    text = selectedProvider === 'gemini' ? await callGemini(call) : await callOpenAI(call);
+  }
 
   const payload = parseCatalogueJson(text);
   const result = sanitiseCataloguePayload(payload);

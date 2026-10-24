@@ -1,5 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import {
   MAX_CATALOGUE_ITEMS,
   computeSqftPerBox,
@@ -9,6 +12,12 @@ import {
   sanitiseCataloguePayload,
   sanitiseExtractedProduct
 } from '../src/ai-catalogue.js';
+import {
+  GEMINI_INLINE_MAX_BYTES,
+  GEMINI_UPLOAD_CHUNK_BYTES,
+  MAX_PDF_BYTES,
+  OPENAI_MAX_PDF_BYTES
+} from '../shared/constants.js';
 
 const PDF = Buffer.from('%PDF-1.4\nfake catalogue\n%%EOF');
 
@@ -140,6 +149,98 @@ test('extracts through Gemini with an inline PDF', async () => {
   assert.equal(result.model, 'gemini-test');
   assert.equal(result.supplier, 'Somany');
   assert.equal(result.products[0].name, 'Carrara');
+});
+
+test('uploads large PDFs through the Gemini File API', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'sai-catalogue-'));
+  const pdfPath = path.join(dir, 'large.pdf');
+  const pdfSize = GEMINI_INLINE_MAX_BYTES + 4 * 1024 * 1024;
+  const pdf = Buffer.alloc(pdfSize, 0x20);
+  pdf.write('%PDF-1.7\n', 0, 'latin1');
+  await writeFile(pdfPath, pdf);
+
+  const uploadUrl = 'https://upload.example/session/1';
+  const events = [];
+  const calls = [];
+  const fetchImpl = async (url, options = {}) => {
+    calls.push({ url, options });
+    if (url.startsWith('https://generativelanguage.googleapis.com/upload/v1beta/files?')) {
+      return new Response(null, { status: 200, headers: { 'x-goog-upload-url': uploadUrl } });
+    }
+    if (url === uploadUrl) {
+      const offset = Number(options.headers['X-Goog-Upload-Offset']);
+      assert.equal(options.body.length, Math.min(GEMINI_UPLOAD_CHUNK_BYTES, pdfSize - offset));
+      if (options.headers['X-Goog-Upload-Command'] === 'upload, finalize') {
+        return new Response(
+          JSON.stringify({
+            file: { name: 'files/abc', uri: 'https://files.example/abc', state: 'ACTIVE' }
+          }),
+          { status: 200 }
+        );
+      }
+      return new Response(null, { status: 308 });
+    }
+    if (url.includes(':generateContent')) {
+      return geminiResponse({ products: [{ name: 'Large Tile', price: 70 }] });
+    }
+    if (options.method === 'DELETE') return new Response(null, { status: 200 });
+    throw new Error(`Unexpected request ${options.method} ${url}`);
+  };
+
+  try {
+    const result = await extractCatalogueFromPdf({
+      pdfPath,
+      fileName: 'large-list.pdf',
+      apiKey: 'test-key',
+      provider: 'gemini',
+      model: 'gemini-test',
+      baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+      fetchImpl,
+      onProgress: (event) => events.push(event)
+    });
+
+    assert.equal(result.products[0].name, 'Large Tile');
+    const start = calls.find((call) =>
+      call.url.startsWith('https://generativelanguage.googleapis.com/upload/v1beta/files?')
+    );
+    assert.equal(start.options.headers['X-Goog-Upload-Protocol'], 'resumable');
+    assert.equal(start.options.headers['X-Goog-Upload-Header-Content-Length'], String(pdfSize));
+
+    const uploads = calls.filter((call) => call.url === uploadUrl);
+    assert.equal(uploads.length, 3);
+    assert.equal(uploads[2].options.headers['X-Goog-Upload-Command'], 'upload, finalize');
+    assert.equal(uploads[2].options.headers['X-Goog-Upload-Offset'], String(GEMINI_UPLOAD_CHUNK_BYTES * 2));
+
+    const generation = calls.find((call) => call.url.includes(':generateContent'));
+    const body = JSON.parse(generation.options.body);
+    assert.equal(body.contents[0].parts[0].file_data.file_uri, 'https://files.example/abc');
+    assert.equal(body.contents[0].parts[0].inline_data, undefined);
+    assert.ok(events.some((event) => event.stage === 'upload' && event.loaded === pdfSize));
+    assert.ok(events.some((event) => event.stage === 'reading'));
+    assert.ok(calls.some((call) => call.options.method === 'DELETE'));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('enforces the 1 GB limit and OpenAI’s smaller PDF limit', async () => {
+  assert.equal(MAX_PDF_BYTES, 1024 * 1024 * 1024);
+  await assert.rejects(
+    () =>
+      extractCatalogueFromPdf({
+        pdfBuffer: Buffer.allocUnsafe(OPENAI_MAX_PDF_BYTES + 1),
+        apiKey: 'key',
+        provider: 'openai',
+        fetchImpl: async () => {
+          throw new Error('should not be called');
+        }
+      }),
+    /OpenAI accepts PDFs up to 32 MB/
+  );
+  await assert.rejects(
+    () => extractCatalogueFromPdf({ pdfPath: path.join(os.tmpdir(), 'missing-catalogue.pdf'), apiKey: 'key' }),
+    /could not be opened/
+  );
 });
 
 test('extracts through OpenAI Responses with a file part', async () => {

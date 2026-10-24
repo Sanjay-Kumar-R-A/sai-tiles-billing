@@ -1,4 +1,4 @@
-const { contextBridge, ipcRenderer } = require('electron');
+const { contextBridge, ipcRenderer, webUtils } = require('electron');
 
 function invoke(channel) {
   return async (...args) => {
@@ -32,7 +32,9 @@ contextBridge.exposeInMainWorld('tiledesk', {
   },
   catalogue: {
     extract: invoke('catalogue:extract'),
-    import: invoke('catalogue:import')
+    import: invoke('catalogue:import'),
+    pathForFile: (file) => webUtils.getPathForFile(file),
+    onProgress: (callback) => subscribe('catalogue:progress', callback)
   },
   customers: {
     list: invoke('customers:list'),
