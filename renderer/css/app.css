@@ -1182,6 +1182,25 @@ svg {
   white-space: nowrap;
 }
 
+.row-actions {
+  width: 92px;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.row-actions .row-delete {
+  width: 28px;
+  height: 28px;
+  vertical-align: middle;
+}
+
+.row-actions .row-chevron {
+  display: inline-flex;
+  margin-left: 4px;
+  color: var(--muted);
+  vertical-align: middle;
+}
+
 .data-table .weak {
   color: var(--muted);
 }

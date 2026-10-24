@@ -1,5 +1,6 @@
 import { todayISO } from '../../../shared/format.js';
 import { icon } from '../icons.js';
+import { openInvoiceDeleteModal } from '../invoice-delete.js';
 import {
   dateText,
   debounce,
@@ -92,7 +93,10 @@ function invoiceRows(invoices) {
           <td>${invoiceStatusChip(invoice)}</td>
           <td class="num money strong">₹${money(invoice.total)}</td>
           <td class="num money">${outstanding ? `<span class="negative">₹${money(invoice.balance)}</span>` : '<span class="muted">—</span>'}</td>
-          <td class="num" style="width:34px;color:var(--muted);">${icon('chevronRight')}</td>
+          <td class="row-actions">
+            <button type="button" class="btn btn-icon btn-danger-soft row-delete" data-delete-invoice="${invoice.id}" title="Delete ${escapeHtml(invoice.invoiceNo)}" aria-label="Delete invoice ${escapeHtml(invoice.invoiceNo)}">${icon('trash')}</button>
+            <span class="row-chevron">${icon('chevronRight')}</span>
+          </td>
         </tr>
       `;
     })
@@ -186,6 +190,15 @@ async function loadList(container) {
 function syncStatusButtons() {
   for (const button of listRoot?.querySelectorAll('[data-status]') ?? []) {
     button.classList.toggle('active', button.dataset.status === listState.status);
+  }
+}
+
+async function openRowDelete(id, container) {
+  try {
+    const invoice = await window.tiledesk.invoices.get(Number(id));
+    openInvoiceDeleteModal(invoice, { onDeleted: () => loadList(container) });
+  } catch (error) {
+    toast(error.message, 'error');
   }
 }
 
@@ -326,6 +339,12 @@ export async function render(root, ctx) {
 
       if (event.target.closest('[data-action="export-invoices"]')) {
         void exportInvoices();
+        return;
+      }
+
+      const deleteButton = event.target.closest('[data-delete-invoice]');
+      if (deleteButton) {
+        void openRowDelete(deleteButton.dataset.deleteInvoice, listContainer);
         return;
       }
 
