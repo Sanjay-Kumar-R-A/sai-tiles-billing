@@ -3,6 +3,7 @@ import { INDIAN_STATES } from '../../../shared/states.js';
 import { brandMark, icon } from '../icons.js';
 import {
   clearFormError,
+  confirmDialog,
   escapeHtml,
   pageHead,
   setButtonLoading,
@@ -10,10 +11,26 @@ import {
   toast
 } from '../ui.js';
 
+const AI_PROVIDERS = {
+  gemini: {
+    label: 'Google Gemini',
+    model: 'gemini-2.5-flash',
+    baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+    hint: 'Free tier available. Create a key in Google AI Studio.'
+  },
+  openai: {
+    label: 'OpenAI',
+    model: 'gpt-4.1-mini',
+    baseUrl: 'https://api.openai.com/v1',
+    hint: 'Uses the Responses API with PDF input and bills your OpenAI account.'
+  }
+};
+
 const SECTIONS = [
   { id: 'setting-profile', label: 'Showroom profile', iconName: 'building' },
   { id: 'setting-tax', label: 'Tax & invoicing', iconName: 'percent' },
   { id: 'setting-bank', label: 'Bank & payment', iconName: 'bank' },
+  { id: 'setting-ai', label: 'AI catalogue', iconName: 'sparkle' },
   { id: 'setting-data', label: 'Data & backup', iconName: 'database' },
   { id: 'setting-about', label: 'About SAI TILES', iconName: 'info' }
 ];
@@ -39,7 +56,10 @@ const TEXT_FIELDS = [
   'defaultGstRate',
   'dueDays',
   'terms',
-  'footerNote'
+  'footerNote',
+  'aiProvider',
+  'aiModel',
+  'aiBaseUrl'
 ];
 
 let pageAbort = null;
@@ -103,10 +123,33 @@ function summaryMetrics(info) {
     .join('');
 }
 
+function aiKeyChip(settings) {
+  if (!settings.aiKeySet) return `<span class="chip chip-neutral">${icon('shield')} No key saved</span>`;
+  if (!settings.aiKeyPersistent) return `<span class="chip chip-gold">${icon('clock')} This session only</span>`;
+  return `<span class="chip chip-green">${icon('checkCircle')} Key saved</span>`;
+}
+
+function aiKeyHint(settings) {
+  if (!settings.aiKeySet) return 'Your key is stored securely in the macOS Keychain and never shown again.';
+  if (!settings.aiKeyPersistent) {
+    return 'Keychain encryption is unavailable on this Mac, so the key is kept in memory only and must be entered again after quitting.';
+  }
+  return 'A key is saved in the macOS Keychain. Enter a new key only when you want to replace it.';
+}
+
+function aiStatusMarkup(settings) {
+  return `
+    ${aiKeyChip(settings)}
+    <button type="button" class="btn btn-sm btn-ghost" data-remove-ai-key${settings.aiKeySet ? '' : ' disabled'}>Remove key</button>
+  `;
+}
+
 function formMarkup(settings, info) {
   const gstinHint = settings.gstin
     ? 'GSTIN prints on every tax invoice. Keep it updated when your registration changes.'
     : 'Add your GSTIN once you are registered; it prints on every tax invoice.';
+  const aiProvider = AI_PROVIDERS[settings.aiProvider] ? settings.aiProvider : 'gemini';
+  const aiProviderInfo = AI_PROVIDERS[aiProvider];
 
   return `
     <div class="page" data-testid="settings-page">
@@ -273,8 +316,56 @@ function formMarkup(settings, info) {
             </div>
           </section>
 
+          <section class="card setting-section" id="setting-ai" data-section>
+            ${sectionHead('AI catalogue', 'Read PDF catalogues and price lists with an AI provider. Billing stays fully offline without it.')}
+            <div class="setting-section-body">
+              <div class="setting-row">
+                <div class="setting-row-copy">
+                  <div class="setting-row-title">API key</div>
+                  <div class="setting-row-text">Kept in the macOS Keychain and used only when you extract a PDF catalogue.</div>
+                </div>
+                <div class="ai-key-status" data-ai-key-status>${aiStatusMarkup(settings)}</div>
+              </div>
+              <div class="field-grid" style="margin-top:16px;">
+                <div class="field">
+                  <label for="st-ai-provider">Provider</label>
+                  <select class="select" id="st-ai-provider" name="aiProvider" data-ai-provider>
+                    <option value="gemini"${aiProvider === 'gemini' ? ' selected' : ''}>Google Gemini</option>
+                    <option value="openai"${aiProvider === 'openai' ? ' selected' : ''}>OpenAI</option>
+                  </select>
+                  <p class="hint">AI providers charge per request. Reading one catalogue counts as one request.</p>
+                </div>
+                <div class="field">
+                  <label for="st-ai-model">Model</label>
+                  <input class="input" id="st-ai-model" name="aiModel" value="${escapeHtml(settings.aiModel || aiProviderInfo.model)}" placeholder="${escapeHtml(aiProviderInfo.model)}" maxlength="80" spellcheck="false" autocomplete="off" data-ai-model />
+                  <p class="hint" data-ai-model-hint>${escapeHtml(aiProviderInfo.hint)}</p>
+                </div>
+                <div class="field field-full">
+                  <label for="st-ai-key">API key <span class="optional">leave blank to keep the saved key</span></label>
+                  <div class="input-affix ai-key-field">
+                    <span class="affix">${icon('shield')}</span>
+                    <input class="input" id="st-ai-key" name="aiApiKey" type="password" value="" placeholder="${settings.aiKeySet ? 'A key is already saved' : 'Paste your API key'}" autocomplete="new-password" spellcheck="false" data-ai-key />
+                  </div>
+                  <p class="hint" data-ai-key-hint>${escapeHtml(aiKeyHint(settings))}</p>
+                </div>
+                <div class="field field-full">
+                  <label for="st-ai-base">API base URL <span class="optional">optional</span></label>
+                  <input class="input" id="st-ai-base" name="aiBaseUrl" value="${escapeHtml(settings.aiBaseUrl)}" placeholder="${escapeHtml(aiProviderInfo.baseUrl)}" maxlength="300" spellcheck="false" autocomplete="off" data-ai-base />
+                  <p class="hint">Only set this for an AI proxy or gateway. Leave blank to use the official endpoint.</p>
+                </div>
+              </div>
+              <div class="import-notice import-notice-info ai-privacy">
+                <span class="import-notice-icon">${icon('shield')}</span>
+                <div class="import-notice-copy">
+                  <strong>What leaves this Mac?</strong>
+                  <span>Only the PDF you choose during an import, sent directly to the provider above. Bills, customers, stock and invoices are never uploaded.</span>
+                </div>
+              </div>
+            </div>
+          </section>
+
           <section class="card setting-section" id="setting-data" data-section>
-            ${sectionHead('Data & backup', 'Everything is stored in a local SQLite file on this Mac. Nothing is uploaded.')}
+            ${sectionHead('Data & backup', 'Bills, stock and customer records live in a local SQLite file. Catalogues are sent to AI only when you import them.')}
             <div class="setting-section-body">
               <div class="metric-strip" style="margin-bottom:16px;">
                 ${summaryMetrics(info)}
@@ -333,9 +424,9 @@ function formMarkup(settings, info) {
               <div class="setting-row">
                 <div class="setting-row-copy">
                   <div class="setting-row-title">Privacy</div>
-                  <div class="setting-row-text">No account, no cloud and no internet connection required. Keep the database file backed up.</div>
+                  <div class="setting-row-text">Bills, customers, stock and invoices stay in the local database. Only a PDF catalogue you choose is sent to your AI provider during an import.</div>
                 </div>
-                <span class="chip chip-neutral">${icon('shield')} Offline</span>
+                <span class="chip chip-neutral">${icon('shield')} Local billing</span>
               </div>
             </div>
           </section>
@@ -375,6 +466,53 @@ function fillForm(settings) {
   if (roundOff) roundOff.checked = Boolean(settings.roundOffEnabled);
 }
 
+function updateAiStatus(settings) {
+  const status = pageRoot?.querySelector('[data-ai-key-status]');
+  if (status) status.innerHTML = aiStatusMarkup(settings);
+  const keyHint = pageRoot?.querySelector('[data-ai-key-hint]');
+  if (keyHint) keyHint.textContent = aiKeyHint(settings);
+  const keyField = settingsForm?.querySelector('[data-ai-key]');
+  if (keyField) {
+    keyField.value = '';
+    keyField.placeholder = settings.aiKeySet ? 'A key is already saved' : 'Paste your API key';
+  }
+}
+
+function syncAiProvider() {
+  if (!settingsForm) return;
+  const info = AI_PROVIDERS[fieldValue('aiProvider')] ?? AI_PROVIDERS.gemini;
+  const modelField = settingsForm.querySelector('[data-ai-model]');
+  if (modelField) {
+    const knownDefaults = Object.values(AI_PROVIDERS).map((provider) => provider.model);
+    if (!modelField.value.trim() || knownDefaults.includes(modelField.value.trim())) {
+      modelField.value = info.model;
+    }
+    modelField.placeholder = info.model;
+  }
+  const modelHint = pageRoot?.querySelector('[data-ai-model-hint]');
+  if (modelHint) modelHint.textContent = info.hint;
+  const baseField = settingsForm.querySelector('[data-ai-base]');
+  if (baseField) baseField.placeholder = info.baseUrl;
+}
+
+async function removeAiKey() {
+  const confirmed = await confirmDialog({
+    title: 'Remove the AI key?',
+    message: 'Catalogue imports will not work until a key is added again. Your catalogue, bills and stock are not affected.',
+    confirmLabel: 'Remove key',
+    danger: true
+  });
+  if (!confirmed) return;
+  try {
+    const updated = await window.tiledesk.settings.update({ aiRemoveKey: true });
+    savedSettings = updated;
+    updateAiStatus(updated);
+    toast('AI key removed', 'success');
+  } catch (error) {
+    toast(error.message, 'error');
+  }
+}
+
 function updatePrefixPreview() {
   const target = pageRoot?.querySelector('[data-prefix-preview]');
   if (!target) return;
@@ -409,7 +547,8 @@ function updateGstinHint() {
 
 function refreshDirtyState() {
   if (!settingsForm || !baseline) return;
-  const dirty = JSON.stringify(collectSettings()) !== JSON.stringify(baseline);
+  const keyPending = Boolean(settingsForm.querySelector('[data-ai-key]')?.value.trim());
+  const dirty = keyPending || JSON.stringify(collectSettings()) !== JSON.stringify(baseline);
   const resetButton = settingsForm.querySelector('[data-reset]');
   if (resetButton) resetButton.disabled = !dirty;
   if (saveHint) {
@@ -460,6 +599,11 @@ async function saveSettings(ctx) {
     settingsForm.querySelector('[name="showroomName"]')?.focus();
     return;
   }
+  if (!String(data.aiModel ?? '').trim()) {
+    showFormError(settingsForm, 'Enter the AI model to use for catalogue imports.');
+    settingsForm.querySelector('[data-ai-model]')?.focus();
+    return;
+  }
 
   setButtonLoading(saveButton, true, 'Saving…');
   try {
@@ -469,9 +613,12 @@ async function saveSettings(ctx) {
       defaultGstRate: Number(data.defaultGstRate),
       profileReviewed: true
     };
+    const aiApiKey = settingsForm.querySelector('[data-ai-key]')?.value.trim() ?? '';
+    if (aiApiKey) patch.aiApiKey = aiApiKey;
     const updated = await window.tiledesk.settings.update(patch);
     savedSettings = updated;
     fillForm(updated);
+    updateAiStatus(updated);
     baseline = collectSettings();
     lastSavedLabel = `Saved at ${new Date().toLocaleTimeString('en-IN', { hour: 'numeric', minute: '2-digit' })}.`;
     pageRoot.querySelector('.setup-banner')?.remove();
@@ -514,11 +661,19 @@ function bindEvents(ctx) {
         return;
       }
 
+      const removeKey = event.target.closest('[data-remove-ai-key]');
+      if (removeKey) {
+        event.preventDefault();
+        void removeAiKey();
+        return;
+      }
+
       const reset = event.target.closest('[data-reset]');
       if (reset) {
         event.preventDefault();
         if (savedSettings) {
           fillForm(savedSettings);
+          updateAiStatus(savedSettings);
           updatePrefixPreview();
           updateGstinHint();
           refreshDirtyState();
@@ -547,6 +702,7 @@ function bindEvents(ctx) {
     'change',
     (event) => {
       if (event.target.matches('[data-state]')) updateGstinHint();
+      if (event.target.matches('[data-ai-provider]')) syncAiProvider();
       refreshDirtyState();
     },
     options
@@ -593,6 +749,11 @@ export async function render(root, ctx) {
   updatePrefixPreview();
   updateGstinHint();
   bindEvents(ctx);
+
+  const requestedSection = String(ctx.query?.section ?? '').replace(/[^a-z0-9-]/gi, '');
+  if (requestedSection && pageRoot.querySelector(`#setting-${requestedSection}`)) {
+    window.requestAnimationFrame(() => scrollToSection(`setting-${requestedSection}`));
+  }
 }
 
 export function cleanup() {

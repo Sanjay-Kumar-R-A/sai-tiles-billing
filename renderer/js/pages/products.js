@@ -349,6 +349,7 @@ export async function render(root, ctx) {
         subtitle: 'Tiles, adhesives and grouts with their pack area, stock and GST details.',
         actions: `
           <button type="button" class="btn" data-action="export-products">${icon('download')} Export CSV</button>
+          <button type="button" class="btn" data-nav="/products/import">${icon('upload')} Import catalogue</button>
           <button type="button" class="btn btn-primary" data-action="add-product">${icon('plus')} Add item</button>
         `
       })}

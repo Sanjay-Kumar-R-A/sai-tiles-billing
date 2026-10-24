@@ -114,6 +114,56 @@ function productRates(product) {
   return { pricePerSqft, pricePerBox };
 }
 
+function sizeMatchKey(value) {
+  return cleanText(value, 40).toLowerCase().replace(/[×x*]/g, 'x').replace(/\s+/g, '');
+}
+
+function productMatchKey(name, brand, size) {
+  return [
+    cleanText(name, 120).toLowerCase().replace(/\s+/g, ' '),
+    cleanText(brand, 60).toLowerCase().replace(/\s+/g, ' '),
+    sizeMatchKey(size)
+  ].join('|');
+}
+
+function buildProductIndex(products) {
+  const bySku = new Map();
+  const byKey = new Map();
+  const byName = new Map();
+
+  for (const product of products) {
+    if (product.sku) bySku.set(product.sku.toUpperCase(), product);
+    const key = productMatchKey(product.name, product.brand, product.size);
+    if (!byKey.has(key)) byKey.set(key, product);
+    const nameKey = cleanText(product.name, 120).toLowerCase().replace(/\s+/g, ' ');
+    if (!byName.has(nameKey)) byName.set(nameKey, []);
+    byName.get(nameKey).push(product);
+  }
+
+  return { bySku, byKey, byName };
+}
+
+function findCatalogueMatch(index, input) {
+  const sku = cleanText(input?.sku, 40).toUpperCase();
+  if (sku && index.bySku.has(sku)) return index.bySku.get(sku);
+
+  const key = productMatchKey(input?.name, input?.brand, input?.size);
+  if (key !== '||' && index.byKey.has(key)) return index.byKey.get(key);
+
+  const nameKey = cleanText(input?.name, 120).toLowerCase().replace(/\s+/g, ' ');
+  const candidates = nameKey ? index.byName.get(nameKey) ?? [] : [];
+  if (!candidates.length) return null;
+
+  const brand = cleanText(input?.brand, 60).toLowerCase();
+  const size = sizeMatchKey(input?.size);
+  const filtered = candidates.filter((product) => {
+    if (brand && cleanText(product.brand, 60).toLowerCase() !== brand) return false;
+    if (size && sizeMatchKey(product.size) !== size) return false;
+    return true;
+  });
+  return filtered.length === 1 ? filtered[0] : null;
+}
+
 function mapProduct(row) {
   const base = {
     id: Number(row.id),
@@ -351,6 +401,21 @@ export class BillingRepository {
       next.dueDays = Math.round(validNumber(patch.dueDays, 'Credit period', { min: 0, max: 365 }));
     }
     if ('jurisdiction' in patch) next.jurisdiction = cleanText(patch.jurisdiction, 120);
+    if ('aiProvider' in patch) {
+      const provider = cleanText(patch.aiProvider, 20).toLowerCase();
+      if (!['gemini', 'openai'].includes(provider)) {
+        throw new Error('Choose Google Gemini or OpenAI for catalogue imports.');
+      }
+      next.aiProvider = provider;
+    }
+    if ('aiModel' in patch) next.aiModel = cleanText(patch.aiModel, 80);
+    if ('aiBaseUrl' in patch) {
+      const baseUrl = cleanText(patch.aiBaseUrl, 300).replace(/\/+$/, '');
+      if (baseUrl && !/^https?:\/\/[^\s]+$/i.test(baseUrl)) {
+        throw new Error('The AI base URL must start with http:// or https://.');
+      }
+      next.aiBaseUrl = baseUrl;
+    }
     next.showroomName = requireText(next.showroomName, 'Showroom name', 120);
 
     this.db
@@ -560,6 +625,373 @@ export class BillingRepository {
         .run(product.id, movementDate, delta, product.costPerBox, note, now);
       return this.getProduct(product.id);
     });
+  }
+
+  previewCatalogue(rows = []) {
+    if (!Array.isArray(rows) || rows.length === 0) {
+      throw new Error('The AI did not return any products to review.');
+    }
+    if (rows.length > 500) throw new Error('Review at most 500 products at a time.');
+
+    const products = this.listProducts({ includeArchived: true });
+    const index = buildProductIndex(products);
+
+    return rows.map((raw, position) => {
+      const rowNumber = position + 1;
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+        return {
+          rowNumber,
+          status: 'invalid',
+          errors: ['This row is not a product.'],
+          name: '',
+          stockBoxes: 0
+        };
+      }
+
+      const match = findCatalogueMatch(index, raw);
+      const errors = [];
+      let normalised = null;
+      try {
+        normalised = this.normaliseProductInput(raw, match ?? null);
+      } catch (error) {
+        errors.push(error.message);
+      }
+
+      let stockBoxes = 0;
+      const stock = Number(raw.stockBoxes ?? 0);
+      if (!Number.isFinite(stock) || stock < 0 || stock > 1000000) {
+        errors.push('Stock must be between 0 and 10,00,000 boxes.');
+      } else {
+        stockBoxes = round3(stock);
+      }
+
+      const status = errors.length ? 'invalid' : match ? (match.active ? 'update' : 'archived') : 'new';
+
+      return {
+        rowNumber,
+        status,
+        matchId: match?.id ?? null,
+        matchName: match?.name ?? '',
+        errors,
+        name: normalised?.name ?? cleanText(raw.name, 120),
+        sku: normalised?.sku ?? cleanText(raw.sku, 40).toUpperCase(),
+        brand: normalised?.brand ?? cleanText(raw.brand, 60),
+        category: normalised?.category ?? cleanText(raw.category, 60),
+        size: normalised?.size ?? cleanText(raw.size, 40),
+        finish: normalised?.finish ?? cleanText(raw.finish, 40),
+        hsn: normalised?.hsn ?? cleanText(raw.hsn, 20),
+        gstRate: normalised?.gstRate ?? (Number(raw.gstRate) || null),
+        sellUnit: normalised?.sellUnit ?? null,
+        price: normalised?.price ?? null,
+        costPerBox: normalised?.costPerBox ?? null,
+        sqftPerBox: normalised?.sqftPerBox ?? null,
+        pcsPerBox: normalised?.pcsPerBox ?? null,
+        stockBoxes,
+        reorderLevel: normalised?.reorderLevel ?? null,
+        batchNo: normalised?.batchNo ?? cleanText(raw.batchNo, 40),
+        notes: normalised?.notes ?? '',
+        active: match?.active ?? null,
+        matchStock: match?.stockBoxes ?? null,
+        matchPrice: match?.price ?? null,
+        matchSellUnit: match?.sellUnit ?? null
+      };
+    });
+  }
+
+  importCatalogue(items = [], { updateDetails = true, addStock = true, source = '' } = {}) {
+    if (!Array.isArray(items) || items.length === 0) {
+      throw new Error('Select at least one product to import.');
+    }
+    if (items.length > 500) throw new Error('Import at most 500 products at a time.');
+
+    const products = this.listProducts({ includeArchived: true });
+    const index = buildProductIndex(products);
+    const byId = new Map(products.map((product) => [product.id, product]));
+    const skuOwners = new Map(
+      products.filter((product) => product.sku).map((product) => [product.sku.toUpperCase(), product])
+    );
+    const shouldUpdateDetails = Boolean(updateDetails);
+    const shouldAddStock = Boolean(addStock);
+    const sourceLabel = cleanText(source, 120);
+    const movementNotes = sourceLabel ? `Imported from ${sourceLabel}` : 'Catalogue import';
+
+    const prepared = [];
+    const skippedRows = [];
+    const seenExisting = new Set();
+    const seenNewSku = new Map();
+    const seenNewKey = new Set();
+
+    items.forEach((raw, position) => {
+      const rowNumber = position + 1;
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+        skippedRows.push({ rowNumber, name: '', error: 'This row is not a product.' });
+        return;
+      }
+
+      let existing = null;
+      const matchId = Number(raw.matchId);
+      if (Number.isFinite(matchId) && matchId > 0) {
+        existing = byId.get(matchId) ?? null;
+      }
+      if (!existing) existing = findCatalogueMatch(index, raw);
+
+      if (existing && !existing.active) {
+        skippedRows.push({
+          rowNumber,
+          name: existing.name,
+          error: 'This item is archived in the catalogue. Restore it before importing.'
+        });
+        return;
+      }
+      if (existing && seenExisting.has(existing.id)) {
+        skippedRows.push({
+          rowNumber,
+          name: existing.name,
+          error: 'This item was already listed earlier in this import.'
+        });
+        return;
+      }
+
+      const stock = Number(raw.stockBoxes ?? 0);
+      if (!Number.isFinite(stock) || stock < 0 || stock > 1000000) {
+        skippedRows.push({
+          rowNumber,
+          name: raw.name,
+          error: 'Stock must be between 0 and 10,00,000 boxes.'
+        });
+        return;
+      }
+      const stockQty = round3(stock);
+
+      let product;
+      try {
+        product = this.normaliseProductInput(raw, existing ?? null);
+      } catch (error) {
+        skippedRows.push({ rowNumber, name: raw.name, error: error.message });
+        return;
+      }
+
+      if (product.sku) {
+        const owner = skuOwners.get(product.sku);
+        if (owner && owner.id !== existing?.id) {
+          if (existing?.sku) {
+            product.sku = existing.sku;
+          } else {
+            skippedRows.push({
+              rowNumber,
+              name: product.name,
+              error: `Item code ${product.sku} is already used by "${owner.name}".`
+            });
+            return;
+          }
+        }
+        if (!existing) {
+          if (seenNewSku.has(product.sku)) {
+            skippedRows.push({
+              rowNumber,
+              name: product.name,
+              error: `Item code ${product.sku} appears more than once in this import.`
+            });
+            return;
+          }
+          seenNewSku.set(product.sku, product.name);
+        }
+      } else if (!existing) {
+        const key = productMatchKey(product.name, product.brand, product.size);
+        if (seenNewKey.has(key)) {
+          skippedRows.push({
+            rowNumber,
+            name: product.name,
+            error: 'This product appears more than once in this import.'
+          });
+          return;
+        }
+        seenNewKey.add(key);
+      }
+
+      if (existing) seenExisting.add(existing.id);
+      const rawCost = Number(raw.costPerBox);
+      prepared.push({
+        rowNumber,
+        existing,
+        product,
+        stockQty,
+        rawCost: Number.isFinite(rawCost) ? rawCost : 0
+      });
+    });
+
+    const summary = {
+      total: items.length,
+      created: 0,
+      updated: 0,
+      detailsUpdated: 0,
+      unchanged: 0,
+      stockAddedBoxes: 0,
+      skipped: skippedRows.length,
+      results: [],
+      skippedRows
+    };
+
+    if (!prepared.length) return summary;
+
+    withTransaction(this.db, () => {
+      const now = nowIso();
+      const today = todayISO();
+
+      const insertProduct = this.db.prepare(`
+        INSERT INTO products (
+          sku, name, brand, category, size, finish, hsn, gst_rate, sell_unit, price,
+          cost_per_box, sqft_per_box, pcs_per_box, stock_boxes, reorder_level, batch_no,
+          notes, active, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+      `);
+      const updateProduct = this.db.prepare(`
+        UPDATE products SET
+          sku = ?, name = ?, brand = ?, category = ?, size = ?, finish = ?, hsn = ?,
+          gst_rate = ?, sell_unit = ?, price = ?, cost_per_box = ?, sqft_per_box = ?,
+          pcs_per_box = ?, reorder_level = ?, batch_no = ?, notes = ?, updated_at = ?
+        WHERE id = ?
+      `);
+      const updateStock = this.db.prepare(
+        'UPDATE products SET stock_boxes = ?, cost_per_box = ?, updated_at = ? WHERE id = ?'
+      );
+      const insertMovement = this.db.prepare(`
+        INSERT INTO stock_movements (
+          product_id, movement_date, type, qty_boxes, unit_cost, reference, notes, invoice_id, created_at
+        ) VALUES (?, ?, ?, ?, ?, 'Catalogue import', ?, NULL, ?)
+      `);
+
+      for (const line of prepared) {
+        const { existing, product, stockQty, rowNumber } = line;
+        const addThisStock = shouldAddStock && stockQty > 0;
+
+        if (existing) {
+          if (!shouldUpdateDetails && !addThisStock) {
+            summary.unchanged += 1;
+            summary.results.push({
+              rowNumber,
+              status: 'unchanged',
+              productId: existing.id,
+              name: existing.name,
+              stockAdded: 0
+            });
+            continue;
+          }
+
+          if (shouldUpdateDetails) {
+            updateProduct.run(
+              product.sku,
+              product.name,
+              product.brand,
+              product.category,
+              product.size,
+              product.finish,
+              product.hsn,
+              product.gstRate,
+              product.sellUnit,
+              product.price,
+              product.costPerBox,
+              product.sqftPerBox,
+              product.pcsPerBox,
+              product.reorderLevel,
+              product.batchNo,
+              product.notes,
+              now,
+              existing.id
+            );
+            summary.detailsUpdated += 1;
+          }
+
+          let stockAdded = 0;
+          if (addThisStock) {
+            const rawCost = line.rawCost;
+            let nextCost = product.costPerBox;
+            if (rawCost > 0) {
+              nextCost =
+                existing.stockBoxes > 0 && existing.costPerBox > 0
+                  ? round2(
+                      (existing.stockBoxes * existing.costPerBox + stockQty * rawCost) /
+                        (existing.stockBoxes + stockQty)
+                    )
+                  : round2(rawCost);
+            }
+            updateStock.run(
+              round3(existing.stockBoxes + stockQty),
+              nextCost,
+              now,
+              existing.id
+            );
+            insertMovement.run(
+              existing.id,
+              today,
+              'purchase',
+              stockQty,
+              nextCost,
+              movementNotes,
+              now
+            );
+            stockAdded = stockQty;
+            summary.stockAddedBoxes = round3(summary.stockAddedBoxes + stockQty);
+          }
+
+          summary.updated += 1;
+          summary.results.push({
+            rowNumber,
+            status: 'updated',
+            productId: existing.id,
+            name: product.name,
+            stockAdded
+          });
+          continue;
+        }
+
+        const openingStock = addThisStock ? stockQty : 0;
+        const result = insertProduct.run(
+          product.sku,
+          product.name,
+          product.brand,
+          product.category,
+          product.size,
+          product.finish,
+          product.hsn,
+          product.gstRate,
+          product.sellUnit,
+          product.price,
+          product.costPerBox,
+          product.sqftPerBox,
+          product.pcsPerBox,
+          openingStock,
+          product.reorderLevel,
+          product.batchNo,
+          product.notes,
+          now,
+          now
+        );
+        const productId = Number(result.lastInsertRowid);
+        if (openingStock > 0) {
+          insertMovement.run(
+            productId,
+            today,
+            'opening',
+            openingStock,
+            product.costPerBox,
+            movementNotes,
+            now
+          );
+          summary.stockAddedBoxes = round3(summary.stockAddedBoxes + openingStock);
+        }
+        summary.created += 1;
+        summary.results.push({
+          rowNumber,
+          status: 'created',
+          productId,
+          name: product.name,
+          stockAdded: openingStock
+        });
+      }
+    });
+
+    return summary;
   }
 
   listCustomers({ search = '', type = '', includeArchived = false } = {}) {

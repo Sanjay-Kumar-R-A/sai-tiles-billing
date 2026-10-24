@@ -30,6 +30,10 @@ contextBridge.exposeInMainWorld('tiledesk', {
     setActive: invoke('products:setActive'),
     adjustStock: invoke('products:adjustStock')
   },
+  catalogue: {
+    extract: invoke('catalogue:extract'),
+    import: invoke('catalogue:import')
+  },
   customers: {
     list: invoke('customers:list'),
     get: invoke('customers:get'),

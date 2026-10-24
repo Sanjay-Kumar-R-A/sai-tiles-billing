@@ -8,6 +8,7 @@ import * as invoices from './pages/invoices.js';
 import * as invoiceDetail from './pages/invoice-detail.js';
 import * as invoicePrint from './pages/invoice-print.js';
 import * as products from './pages/products.js';
+import * as catalogueImport from './pages/catalogue-import.js';
 import * as customers from './pages/customers.js';
 import * as stock from './pages/stock.js';
 import * as reports from './pages/reports.js';
@@ -20,6 +21,7 @@ const ROUTES = [
   { pattern: /^\/invoices\/(\d+)\/print$/, page: invoicePrint, label: 'Print invoice', nav: 'invoices', print: true },
   { pattern: /^\/invoices\/(\d+)$/, page: invoiceDetail, label: 'Invoice', nav: 'invoices' },
   { pattern: '/products', page: products, label: 'Products', nav: 'products' },
+  { pattern: '/products/import', page: catalogueImport, label: 'Import catalogue', nav: 'products' },
   { pattern: '/customers', page: customers, label: 'Customers', nav: 'customers' },
   { pattern: '/stock', page: stock, label: 'Stock', nav: 'stock' },
   { pattern: '/reports', page: reports, label: 'Reports', nav: 'reports' },

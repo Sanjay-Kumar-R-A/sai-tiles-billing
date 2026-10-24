@@ -34,6 +34,7 @@ const ICONS = {
   restore: '<path d="M3.5 12a8.5 8.5 0 1 0 2.6-6.1"/><path d="M3.5 4v5.5H9"/>',
   printer: '<path d="M6.5 9V3.5h11V9"/><path d="M6.5 17H4a1.5 1.5 0 0 1-1.5-1.5v-5A1.5 1.5 0 0 1 4 9h16a1.5 1.5 0 0 1 1.5 1.5v5A1.5 1.5 0 0 1 20 17h-2.5"/><rect x="6.5" y="14" width="11" height="6.5" rx="1"/>',
   download: '<path d="M12 3.5v11"/><path d="m7.5 11 4.5 4.5L16.5 11"/><path d="M4 19.5h16"/>',
+  upload: '<path d="M12 16.5v-12"/><path d="m7.5 9 4.5-4.5L16.5 9"/><path d="M4 20.5h16"/>',
   database:
     '<ellipse cx="12" cy="5.6" rx="7.5" ry="2.9"/><path d="M4.5 5.6v6.2c0 1.6 3.4 2.9 7.5 2.9s7.5-1.3 7.5-2.9V5.6"/><path d="M4.5 11.8v6.3c0 1.6 3.4 2.9 7.5 2.9s7.5-1.3 7.5-2.9v-6.3"/>',
   folder:

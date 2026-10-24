@@ -28,7 +28,10 @@ export const DEFAULT_SETTINGS = {
   terms:
     '1. Goods once sold will not be taken back or exchanged.\n2. Please inspect tiles for shade, size and quality before installation.\n3. Claims for breakage or shortage must be made at the time of delivery.\n4. Payment by cheque is subject to realisation.',
   footerNote: 'Thank you for choosing SAI TILES.',
-  profileReviewed: false
+  profileReviewed: false,
+  aiProvider: 'gemini',
+  aiModel: 'gemini-2.5-flash',
+  aiBaseUrl: ''
 };
 
 const SCHEMA = `

@@ -415,3 +415,159 @@ test('database seeds a starter catalogue when requested', (t) => {
   assert.equal(repo.listInvoices().total, 0);
   assert.equal(repo.getDashboard().todayCount, 0);
 });
+
+test('previews catalogue imports with update, new, invalid and archived rows', (t) => {
+  const { repo, product } = fixture(t);
+  const carrara = repo.createProduct({
+    name: 'Carrara Statuario',
+    sku: 'C1',
+    brand: 'Somany',
+    size: '600 × 1200 mm',
+    sellUnit: 'sqft',
+    price: 78,
+    costPerBox: 852,
+    sqftPerBox: 15.5
+  });
+  const archived = repo.createProduct({
+    name: 'Old Stock Tile',
+    sku: 'OLD1',
+    sellUnit: 'box',
+    price: 20
+  });
+  repo.setProductActive(archived.id, false);
+
+  const preview = repo.previewCatalogue([
+    { name: 'Renamed Aspen', sku: 'A1', price: 66, stockBoxes: 4 },
+    { name: 'Carrara Statuario', brand: 'Somany', size: '600x1200 mm', price: 80 },
+    { name: 'New Tile', sku: 'N1', price: 50, sqftPerBox: 10 },
+    { name: 'Broken row', sku: 'BAD', sellUnit: 'sqft', price: 10 },
+    { name: 'Old Stock Tile', sku: 'OLD1', stockBoxes: 2 }
+  ]);
+
+  assert.equal(preview[0].status, 'update');
+  assert.equal(preview[0].matchId, product.id);
+  assert.equal(preview[0].stockBoxes, 4);
+  assert.equal(preview[1].status, 'update');
+  assert.equal(preview[1].matchId, carrara.id);
+  assert.equal(preview[2].status, 'new');
+  assert.equal(preview[2].name, 'New Tile');
+  assert.equal(preview[3].status, 'invalid');
+  assert.match(preview[3].errors.join(' '), /Area per box/);
+  assert.equal(preview[4].status, 'archived');
+  assert.equal(preview[4].matchId, archived.id);
+});
+
+test('imports a catalogue, adds stock and creates new products', (t) => {
+  const { repo, product } = fixture(t);
+
+  const summary = repo.importCatalogue([
+    { matchId: product.id, name: 'Aspen Grey Matt', sku: 'A1', price: 70, stockBoxes: 5 },
+    {
+      name: 'New Tile',
+      sku: 'N1',
+      brand: 'Nitco',
+      category: 'Floor Tile',
+      size: '600 × 600 mm',
+      finish: 'Matt',
+      hsn: '6907',
+      gstRate: 18,
+      sellUnit: 'sqft',
+      price: 45,
+      costPerBox: 400,
+      sqftPerBox: 15.5,
+      pcsPerBox: 4,
+      stockBoxes: 20
+    },
+    { name: 'Broken row', sku: 'BAD', sellUnit: 'sqft', price: 10 },
+    { name: 'Duplicate Aspen', sku: 'A1', price: 70, stockBoxes: 5 }
+  ], { source: 'price-list.pdf' });
+
+  assert.equal(summary.total, 4);
+  assert.equal(summary.created, 1);
+  assert.equal(summary.updated, 1);
+  assert.equal(summary.detailsUpdated, 1);
+  assert.equal(summary.skipped, 2);
+  assert.equal(summary.stockAddedBoxes, 25);
+  assert.equal(summary.results.filter((row) => row.status === 'created').length, 1);
+  assert.match(summary.skippedRows.map((row) => row.error).join(' '), /Area per box/);
+  assert.match(summary.skippedRows.map((row) => row.error).join(' '), /already listed/);
+
+  const aspen = repo.getProduct(product.id);
+  assert.equal(aspen.price, 70);
+  assert.equal(aspen.stockBoxes, 15);
+
+  const newTile = repo.listProducts().find((entry) => entry.sku === 'N1');
+  assert.ok(newTile);
+  assert.equal(newTile.name, 'New Tile');
+  assert.equal(newTile.stockBoxes, 20);
+  assert.equal(newTile.price, 45);
+
+  const aspenPurchases = repo
+    .listStockMovements({ productId: product.id })
+    .filter((movement) => movement.type === 'purchase');
+  assert.equal(aspenPurchases.length, 1);
+  assert.equal(aspenPurchases[0].qtyBoxes, 5);
+  assert.equal(aspenPurchases[0].notes, 'Imported from price-list.pdf');
+  assert.equal(aspenPurchases[0].reference, 'Catalogue import');
+
+  const opening = repo
+    .listStockMovements({ productId: newTile.id })
+    .find((movement) => movement.type === 'opening');
+  assert.ok(opening);
+  assert.equal(opening.qtyBoxes, 20);
+  assert.equal(opening.notes, 'Imported from price-list.pdf');
+});
+
+test('imports stock only or details only when asked', (t) => {
+  const { repo, product } = fixture(t);
+
+  const stockOnly = repo.importCatalogue(
+    [{ matchId: product.id, name: 'Aspen Grey Matt', sku: 'A1', price: 999, stockBoxes: 3 }],
+    { updateDetails: false, addStock: true }
+  );
+  assert.equal(stockOnly.updated, 1);
+  assert.equal(stockOnly.detailsUpdated, 0);
+  let current = repo.getProduct(product.id);
+  assert.equal(current.price, 62);
+  assert.equal(current.stockBoxes, 13);
+
+  const detailsOnly = repo.importCatalogue(
+    [{ matchId: product.id, name: 'Aspen Grey Matt', sku: 'A1', price: 80, stockBoxes: 7 }],
+    { updateDetails: true, addStock: false }
+  );
+  assert.equal(detailsOnly.updated, 1);
+  assert.equal(detailsOnly.detailsUpdated, 1);
+  assert.equal(detailsOnly.stockAddedBoxes, 0);
+  current = repo.getProduct(product.id);
+  assert.equal(current.price, 80);
+  assert.equal(current.stockBoxes, 13);
+  assert.equal(
+    repo.listStockMovements({ productId: product.id }).filter((movement) => movement.type === 'purchase').length,
+    1
+  );
+});
+
+test('imports weighted stock cost and skips archived products', (t) => {
+  const { repo, product } = fixture(t);
+  const archived = repo.createProduct({
+    name: 'Old Stock Tile',
+    sku: 'OLD1',
+    sellUnit: 'box',
+    price: 20,
+    stockBoxes: 5
+  });
+  repo.setProductActive(archived.id, false);
+
+  const summary = repo.importCatalogue([
+    { matchId: product.id, name: 'Aspen Grey Matt', sku: 'A1', stockBoxes: 10, costPerBox: 700 },
+    { name: 'Old Stock Tile', sku: 'OLD1', stockBoxes: 2 }
+  ]);
+
+  assert.equal(summary.updated, 1);
+  assert.equal(summary.skipped, 1);
+  assert.match(summary.skippedRows[0].error, /archived/);
+  const current = repo.getProduct(product.id);
+  assert.equal(current.stockBoxes, 20);
+  assert.equal(current.costPerBox, 675.5);
+  assert.equal(repo.getProduct(archived.id).stockBoxes, 5);
+});

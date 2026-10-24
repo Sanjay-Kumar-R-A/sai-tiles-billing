@@ -1,10 +1,11 @@
-import { app, BrowserWindow, Menu, dialog, ipcMain, shell } from 'electron';
+import { app, BrowserWindow, Menu, dialog, ipcMain, safeStorage, shell } from 'electron';
 import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { openDatabase } from './db.js';
 import { BillingRepository } from './repository.js';
+import { MAX_PDF_BYTES, extractCatalogueFromPdf } from './ai-catalogue.js';
 import { todayISO } from '../shared/format.js';
 
 const APP_NAME = 'SAI TILES';
@@ -29,6 +30,10 @@ let database = null;
 let repository = null;
 let databasePath = null;
 let backupsDir = null;
+let sessionAiKey = '';
+let aiKeySessionOnly = false;
+
+const AI_KEY_META = 'ai_api_key_encrypted';
 
 const hasLock = app.requestSingleInstanceLock();
 
@@ -212,10 +217,118 @@ function handle(channel, callback) {
   });
 }
 
+function readAiKey() {
+  if (sessionAiKey) return sessionAiKey;
+  if (!database || !safeStorage.isEncryptionAvailable()) return '';
+  const row = database.prepare('SELECT value FROM meta WHERE key = ?').get(AI_KEY_META);
+  if (!row?.value) return '';
+  try {
+    return safeStorage.decryptString(Buffer.from(row.value, 'base64'));
+  } catch {
+    return '';
+  }
+}
+
+function saveAiKey(value) {
+  const key = String(value ?? '').trim();
+  if (!key) return;
+  sessionAiKey = key;
+  aiKeySessionOnly = true;
+  if (!safeStorage.isEncryptionAvailable()) return;
+  try {
+    const encrypted = safeStorage.encryptString(key).toString('base64');
+    database
+      .prepare(
+        "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+      )
+      .run(AI_KEY_META, encrypted);
+    aiKeySessionOnly = false;
+  } catch (error) {
+    console.error('Could not save the AI key in the macOS Keychain:', error);
+  }
+}
+
+function removeAiKey() {
+  sessionAiKey = '';
+  aiKeySessionOnly = false;
+  database.prepare('DELETE FROM meta WHERE key = ?').run(AI_KEY_META);
+}
+
+function withAiStatus(settings) {
+  return {
+    ...settings,
+    aiKeySet: Boolean(readAiKey()),
+    aiKeyPersistent: !aiKeySessionOnly && safeStorage.isEncryptionAvailable()
+  };
+}
+
+function pdfBufferFrom(data) {
+  if (Buffer.isBuffer(data)) return data;
+  if (data instanceof ArrayBuffer) return Buffer.from(data);
+  if (ArrayBuffer.isView(data)) return Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+  if (Array.isArray(data?.data)) return Buffer.from(data.data);
+  return null;
+}
+
+function safePdfFileName(value) {
+  return (
+    path
+      .basename(String(value || 'catalogue.pdf'))
+      .replace(/[\\/:*?"<>|\u0000-\u001f]/g, '-')
+      .trim()
+      .slice(0, 160) || 'catalogue.pdf'
+  );
+}
+
 function registerIpcHandlers() {
-  handle('settings:get', () => repository.getSettings());
-  handle('settings:update', (patch) => repository.updateSettings(patch));
+  handle('settings:get', () => withAiStatus(repository.getSettings()));
+  handle('settings:update', (patch = {}) => {
+    const { aiApiKey, aiRemoveKey, ...settingsPatch } = patch ?? {};
+    const updated = repository.updateSettings(settingsPatch);
+    if (aiRemoveKey) removeAiKey();
+    if (typeof aiApiKey === 'string' && aiApiKey.trim()) saveAiKey(aiApiKey);
+    return withAiStatus(updated);
+  });
   handle('categories:list', () => repository.getCategories());
+
+  handle('catalogue:extract', async ({ data, fileName } = {}) => {
+    const pdfBuffer = pdfBufferFrom(data);
+    if (!pdfBuffer?.length) throw new Error('Choose a PDF catalogue first.');
+    if (pdfBuffer.length > MAX_PDF_BYTES) {
+      throw new Error('This PDF is larger than 25 MB. Try a smaller catalogue.');
+    }
+    if (!pdfBuffer.subarray(0, 1024).includes(Buffer.from('%PDF-'))) {
+      throw new Error('That file is not a PDF. Choose a PDF catalogue or price list.');
+    }
+
+    const settings = repository.getSettings();
+    const apiKey = readAiKey();
+    if (!apiKey) throw new Error('Add the AI API key in Settings → AI catalogue first.');
+
+    const safeName = safePdfFileName(fileName);
+    const extraction = await extractCatalogueFromPdf({
+      pdfBuffer,
+      fileName: safeName,
+      apiKey,
+      provider: settings.aiProvider,
+      model: settings.aiModel,
+      baseUrl: settings.aiBaseUrl
+    });
+    const items = repository.previewCatalogue(extraction.products);
+
+    return {
+      fileName: safeName,
+      supplier: extraction.supplier,
+      provider: extraction.provider,
+      model: extraction.model,
+      items,
+      warnings: extraction.warnings
+    };
+  });
+
+  handle('catalogue:import', ({ items, updateDetails, addStock, source } = {}) =>
+    repository.importCatalogue(items, { updateDetails, addStock, source })
+  );
 
   handle('products:list', (filters) => repository.listProducts(filters));
   handle('products:get', (id) => repository.getProduct(id));
